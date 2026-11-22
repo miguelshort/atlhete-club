@@ -1,0 +1,161 @@
+name: Athlete Club · compilar APK
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:   # permite lanzarlo a mano desde la pestaña Actions
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      # El proyecto puede estar en la raíz, dentro de una carpeta (p. ej. AthleteClub/) o subido
+      # como ZIP sin descomprimir (p. ej. Athlete_Club_v2_proyecto.zip): en ese caso se descomprime aquí.
+      - name: Localizar el proyecto Android
+        run: |
+          echo "Contenido del repositorio:"
+          find . -maxdepth 3 -not -path "./.git*" | sort | head -n 80
+          find_settings() { find . -name settings.gradle.kts -not -path "*/build/*" -not -path "*/.git/*" -not -path "*/__MACOSX/*" | head -n 1; }
+          SETTINGS=$(find_settings)
+          if [ -z "$SETTINGS" ]; then
+            ZIP=$(find . -iname "*.zip" -not -path "./.git/*" | head -n 1)
+            if [ -n "$ZIP" ]; then
+              echo "::notice::No hay proyecto descomprimido; se descomprime $ZIP"
+              mkdir -p _proyecto && unzip -q -o "$ZIP" -d _proyecto
+              SETTINGS=$(find_settings)
+            fi
+          fi
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::El repositorio no contiene el proyecto: falta settings.gradle.kts (y no hay ningún .zip con él). Sube el contenido de la carpeta AthleteClub (app/, gradle/, build.gradle.kts, settings.gradle.kts, gradle.properties…) o el ZIP del proyecto."
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Proyecto encontrado en: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Instalar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # El paquete «tools» ya no existe en las cmdline-tools actuales y setup-android lo pide por defecto:
+      # se indican explícitamente los paquetes que necesita el proyecto (compileSdk 35).
+      - name: Instalar Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+          log-accepted-android-sdk-licenses: false
+
+      # Instala Gradle 8.14.3 (la versión del proyecto). Se usa si el repositorio no incluye gradlew
+      # o gradle-wrapper.jar (GitHub web a veces no los sube).
+      - name: Configurar Gradle (con caché)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      # Las claves son opcionales: sin secretos la app compila igual
+      # (mapas OSM de desarrollo; cuenta y Club como «no configurado»).
+      - name: Crear local.properties
+        env:
+          MAP_TILE_URL: ${{ secrets.MAP_TILE_URL }}
+          MAP_ATTRIBUTION: ${{ secrets.MAP_ATTRIBUTION }}
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+        run: |
+          {
+            echo "sdk.dir=${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+            echo "MAP_TILE_URL=$MAP_TILE_URL"
+            echo "MAP_ATTRIBUTION=$MAP_ATTRIBUTION"
+            echo "FIREBASE_API_KEY=$FIREBASE_API_KEY"
+            echo "FIREBASE_APP_ID=$FIREBASE_APP_ID"
+            echo "FIREBASE_PROJECT_ID=$FIREBASE_PROJECT_ID"
+          } > "$PROJECT_DIR/local.properties"
+
+      # Firma estable: sin esto, cada ejecución crea una clave de depuración nueva y el APK
+      # NO se instala encima de la versión anterior. Guarda tu debug.keystore en base64 en el
+      # secreto DEBUG_KEYSTORE_BASE64:  base64 -w0 ~/.android/debug.keystore
+      - name: Restaurar clave de firma de depuración
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
+            mkdir -p ~/.android
+            echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
+            echo "Clave de depuración restaurada: el APK podrá actualizar la app instalada."
+          else
+            echo "::warning::Sin DEBUG_KEYSTORE_BASE64: el APK usará una clave nueva y no se instalará encima de la versión actual."
+          fi
+
+      # Usa el wrapper si está completo; si no, el Gradle instalado arriba.
+      - name: Elegir Gradle
+        run: |
+          cd "$PROJECT_DIR"
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            echo "GRADLE_CMD=./gradlew" >> "$GITHUB_ENV"
+            echo "Usando gradlew del proyecto"
+          else
+            echo "GRADLE_CMD=gradle" >> "$GITHUB_ENV"
+            echo "::notice::No hay gradlew o gradle-wrapper.jar en el repositorio: se usa Gradle 8.14.3 instalado."
+          fi
+
+      # Primero el APK: así un fallo en las pruebas no impide obtenerlo.
+      # Los errores de compilación (líneas «e:» de Kotlin y «[ksp]» de Room) se copian al resumen
+      # de la ejecución para poder leerlos sin bucear en el registro.
+      - name: Compilar APK de depuración
+        run: |
+          cd "$PROJECT_DIR"
+          set -o pipefail
+          $GRADLE_CMD assembleDebug --console=plain --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Errores de compilación (resumen)
+        if: failure()
+        run: |
+          {
+            echo "## Errores de compilación"
+            echo '```'
+            grep -E "^e: |\[ksp\]|error:|Exception:|What went wrong|> Task .* FAILED|maximum supported version" "$RUNNER_TEMP/build.log" | grep -vE "^\s+at " | head -n 60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "===== PRIMEROS ERRORES ====="
+          grep -E "^e: |\[ksp\]|error:|Exception:|What went wrong|maximum supported version" -A 3 "$RUNNER_TEMP/build.log" | grep -vE "^\s+at " | head -n 80
+
+      - name: Pruebas (métricas, deportes y reglas)
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          $GRADLE_CMD testDebugUnitTest --console=plain
+
+      - name: Renombrar APK
+        run: |
+          VERSION=$(grep -oP 'versionName = "\K[^"]+' "$PROJECT_DIR/app/build.gradle.kts" || echo "dev")
+          mkdir -p dist
+          cp "$PROJECT_DIR"/app/build/outputs/apk/debug/*.apk "dist/AthleteClub-${VERSION}-debug.apk"
+
+      - name: Subir APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: athlete-club-debug-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Subir informes de tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/
+          if-no-files-found: ignore
